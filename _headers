@@ -1,0 +1,11 @@
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer-when-downgrade
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+  Cross-Origin-Opener-Policy: same-origin
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; media-src 'self' blob: https://telugu-tts-proxy.mohammadashrafali96.workers.dev https://translate.googleapis.com https://translate.google.com https://api.allorigins.win https://api.codetabs.com; connect-src 'self' https://telugu-tts-proxy.mohammadashrafali96.workers.dev https://translate.googleapis.com https://translate.google.com https://api.allorigins.win https://api.codetabs.com https://api.mymemory.translated.net; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'; worker-src 'self' blob: https://cdn.jsdelivr.net
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
