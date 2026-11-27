@@ -90,7 +90,8 @@ async function handleTts(request, url, ctx) {
       cf: { cacheTtl: 86400, cacheEverything: true },
     });
   } catch (err) {
-    return json({ error: "Upstream fetch failed.", detail: String(err) }, 502);
+    console.error("Upstream fetch failed", err);
+    return json({ error: "Upstream fetch failed." }, 502);
   }
 
   if (!upstream.ok) {
