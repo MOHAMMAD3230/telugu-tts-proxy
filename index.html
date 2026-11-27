@@ -7,7 +7,7 @@
 <meta name="description" content="Convert English PDF books to Telugu PDF and Telugu MP3 audiobook - fast translation, crash-free PDF &amp; MP3" />
 
 <!-- CSP: valid directives only. `frame-ancestors` is NOT honoured in <meta>
-     and must be sent as an HTTP header (see _headers file). -->
+     and must be sent as an HTTP header. -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; media-src 'self' blob: https://telugu-tts-proxy.mohammadashrafali96.workers.dev https://translate.googleapis.com https://translate.google.com https://api.allorigins.win https://api.codetabs.com; connect-src 'self' https://telugu-tts-proxy.mohammadashrafali96.workers.dev https://translate.googleapis.com https://translate.google.com https://api.allorigins.win https://api.codetabs.com https://api.mymemory.translated.net; object-src 'none'; base-uri 'self'; form-action 'none'; worker-src 'self' blob: https://cdn.jsdelivr.net;" />
 <meta name="referrer" content="no-referrer-when-downgrade" />
 
@@ -15,8 +15,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;600;700&display=swap" rel="stylesheet">
 
-<!-- Version-pinned CDN scripts. SRI hashes removed: a stale hash makes the
-     browser refuse to execute the script and the whole app dies silently. -->
+<!-- Version-pinned CDN scripts. No SRI: a stale hash silently kills the app. -->
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 
@@ -237,9 +236,10 @@
       <div class="row">
         <label for="workers">Parallel workers</label>
         <select id="workers">
-          <option value="2" selected>2 (crash-safe / mobile)</option>
-          <option value="3">3 (balanced)</option>
-          <option value="4">4 (desktop)</option>
+          <option value="2">2 (crash-safe / mobile)</option>
+          <option value="4" selected>4 (balanced)</option>
+          <option value="6">6 (fast)</option>
+          <option value="8">8 (desktop / fastest)</option>
         </select>
       </div>
       <div class="row">
@@ -349,8 +349,8 @@ const TTS_PROXY = 'https://telugu-tts-proxy.mohammadashrafali96.workers.dev';
 
 const CFG = {
   MAX_BYTES: 50 * 1024 * 1024,
-  BATCH_SIZE: 35,
-  BATCH_DELAY_MS: 2000,
+  BATCH_SIZE: 60,
+  BATCH_DELAY_MS: 400,
   TRANSLATE_ENDPOINT: 'https://translate.googleapis.com/translate_a/single',
   TRANSLATE_FALLBACK: 'https://api.mymemory.translated.net/get',
   TTS_ENDPOINT: 'https://translate.googleapis.com/translate_tts',
@@ -372,6 +372,8 @@ const CFG = {
   MAX_MP3_BYTES: 40 * 1024 * 1024,
   PDF_RENDER_SCALE: 2,
   PDF_JPEG_QUALITY: 0.82,
+  GTX_MAX_Q: 8,
+  GTX_MAX_CHARS: 1200,
 };
 
 const PDFJS_OK = !!window.pdfjsLib;
@@ -885,6 +887,85 @@ async function translateParagraph(text, attempt = 0) {
   }
 }
 
+/* ---- batched translation: many paragraphs per HTTP request ---- */
+
+async function gtxBatch(texts) {
+  const params = new URLSearchParams({ client: 'gtx', sl: 'en', tl: 'te', dt: 't' });
+  for (const t of texts) params.append('q', t.slice(0, 1200));
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch(CFG.TRANSLATE_ENDPOINT + '?' + params.toString(), { signal: controller.signal });
+    clearTimeout(timer);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    // Shape guard: if Google answers with anything unexpected we bail out and
+    // fall back to one-paragraph-at-a-time, so nothing is ever mistranslated.
+    if (!Array.isArray(data) || data.length !== texts.length) throw new Error('unexpected response shape');
+    return data.map((entry) => {
+      if (!Array.isArray(entry)) return null;
+      let full = '';
+      for (const seg of entry) if (seg && seg[0]) full += seg[0];
+      return full.trim() || null;
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
+function packBatches(tasks) {
+  const batches = [];
+  let cur = [];
+  let chars = 0;
+  for (const t of tasks) {
+    if (cur.length && (cur.length >= CFG.GTX_MAX_Q || chars + t.en.length > CFG.GTX_MAX_CHARS)) {
+      batches.push(cur);
+      cur = [];
+      chars = 0;
+    }
+    cur.push(t);
+    chars += t.en.length;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+
+async function translateTasks(tasks, concurrency, onDone) {
+  // 1. Serve whatever is already cached, no network at all.
+  const pending = [];
+  for (const t of tasks) {
+    const cached = await cacheGet(t.en);
+    if (cached) { t.te = cached; onDone(t); } else pending.push(t);
+  }
+  if (!pending.length) return;
+
+  // 2. Fetch the rest in batches.
+  const batches = packBatches(pending);
+  await pool(batches, concurrency, async (batch) => {
+    if (S.cancel) return;
+    let results = null;
+    try {
+      results = await gtxBatch(batch.map((t) => t.en));
+    } catch (e) {
+      results = null; // fall through to per-paragraph below
+    }
+    for (let i = 0; i < batch.length; i++) {
+      if (S.cancel) return;
+      const t = batch[i];
+      let te = results ? results[i] : null;
+      if (te) {
+        await cachePut(t.en, te);
+      } else {
+        te = await translateParagraph(t.en); // existing single-paragraph path
+      }
+      t.te = te || t.en;
+      onDone(t);
+    }
+  }, 0);
+}
+
 async function gtxSingle(text) {
   const url = CFG.TRANSLATE_ENDPOINT + '?client=gtx&sl=en&tl=te&dt=t&q=' + encodeURIComponent(text.slice(0, 1200));
   const controller = new AbortController();
@@ -1093,7 +1174,7 @@ ui.convert.addEventListener('click', async () => {
   if (!rateLimit('convert', 2000)) return;
 
   const range = parsePageRange(S.pages.length);
-  const workers = Math.max(1, Math.min(4, parseInt(ui.workers.value, 10) || 2));
+  const workers = Math.max(1, Math.min(8, parseInt(ui.workers.value, 10) || 4));
   const mode = ui.pdfMode.value || 'telugu';
   const fontSize = parseInt(ui.fontSize.value, 10) || 14;
 
@@ -1156,20 +1237,19 @@ ui.convert.addEventListener('click', async () => {
     }
 
     if (batchTasks.length) {
-      await pool(batchTasks, workers, async (task) => {
-        const te = await translateParagraph(task.en);
+      await translateTasks(batchTasks, workers, (task) => {
         const entry = pageMap.get(task.pageIdx);
-        if (entry) entry.paragraphs[task.pIdx] = { en: task.en, te };
+        if (entry) entry.paragraphs[task.pIdx] = { en: task.en, te: task.te };
         completed++;
         const pct = Math.min(78, 2 + Math.round((completed / allTasks.length) * 76));
         const elapsed = Math.max(0.2, (performance.now() - t0) / 1000);
         const eta = Math.max(0, Math.round((allTasks.length - completed) / Math.max(0.1, completed / elapsed)));
         setProgress(pct, `Batch ${b + 1}/${batches.length} · ${completed}/${allTasks.length} blocks · ETA ${eta}s`);
-        if (completed % 12 === 0) {
+        if (completed % 24 === 0) {
           S.translatedPages = Array.from(pageMap.values()).sort((x, y) => x.pageIdx - y.pageIdx);
           showPreview(S.previewIdx);
         }
-      }, 30);
+      });
     } else {
       log(`  Batch ${b + 1}: all paragraphs already cached, skipping.`);
     }
@@ -1515,7 +1595,7 @@ ui.mp3Btn.addEventListener('click', async () => {
 
   setProgress(5, `Fetching Telugu MP3 (route #${S.workingTtsRouteIdx + 1})…`);
 
-  const audioWorkers = Math.min(2, Math.max(1, parseInt(ui.workers.value, 10) || 2));
+  const audioWorkers = Math.min(6, Math.max(2, parseInt(ui.workers.value, 10) || 2));
   const orderedSlots = new Array(chunks.length).fill(null);
   let cursor = 0, done = 0, failed = 0, consecutiveFails = 0, totalBytes = 0;
   let byteCapReached = false, blockedEarly = false;
@@ -1548,7 +1628,7 @@ ui.mp3Btn.addEventListener('click', async () => {
       const elapsed = Math.max(0.2, (performance.now() - t0) / 1000);
       const eta = Math.max(0, Math.round((chunks.length - done) / Math.max(0.1, done / elapsed)));
       setProgress(5 + Math.min(95, Math.round((done / chunks.length) * 95)), `Audio ${done}/${chunks.length} · ETA ${eta}s`);
-      await sleep(55);
+      await sleep(0);
     }
   }));
 
@@ -1623,13 +1703,13 @@ ui.security.addEventListener('click', () => {
   log('7. Filename sanitization: strips path separators, control chars, parent-dir sequences.', 'ok');
   log('8. Own TTS proxy Worker — no third-party CORS proxy dependency.', 'ok');
   log('9. No analytics, ads or trackers.', 'ok');
-  log('NOTE: frame-ancestors / X-Content-Type-Options cannot be set from <meta> — send them as HTTP headers (see _headers).', 'warn');
+  log('NOTE: frame-ancestors / X-Content-Type-Options cannot be set from <meta> — send them as HTTP headers.', 'warn');
 });
 
 ui.help.addEventListener('click', () => {
   toast('1) Upload PDF → 2) Convert → 3) Download PDF or play MP3');
   log('Help: upload a text-based PDF, pick a page range (or "All pages"), click Convert to Telugu.', 'info');
-  log('  • Full-book mode: processed in sequential batches of 35 pages with a 2s pause between batches.', 'info');
+  log('  • Translation is batched: up to 8 paragraphs per HTTP request, 4-8 requests in parallel.', 'info');
   log('  • Already-translated paragraphs are cached — a re-run only fetches what is missing.', 'info');
   log('  • MP3: served through your own Cloudflare Worker, so the download works reliably.', 'info');
   log('  • If the Worker is unreachable, the app falls back to public proxies, then to streaming playback.', 'info');
